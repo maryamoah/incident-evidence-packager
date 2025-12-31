@@ -7,7 +7,12 @@ from pathlib import Path
 from datetime import datetime, timezone
 from collections import Counter
 
+import requests
 
+
+# -----------------------------
+# Hashing
+# -----------------------------
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:
@@ -16,6 +21,9 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+# -----------------------------
+# Helpers
+# -----------------------------
 def file_kind(path: Path) -> str:
     return path.suffix.lower().lstrip(".") or "no_ext"
 
@@ -45,7 +53,61 @@ def build_summary(manifest, metadata):
     return "\n".join(lines)
 
 
-def package_evidence(input_dir: Path, output_zip: Path, metadata: dict):
+# -----------------------------
+# Optional local AI (Ollama)
+# -----------------------------
+def ai_summary_local(summary_md: str, metadata: dict, model: str = "llama3") -> str:
+    """
+    Optional AI summary using a local Ollama model.
+    Requires Ollama running on http://localhost:11434
+    """
+    try:
+        prompt = f"""
+Rewrite the following incident summary into a short executive summary.
+
+Rules:
+- bullet points only
+- no speculation
+- professional incident response tone
+- include suggested next steps (max 3 bullets)
+
+Metadata:
+{json.dumps(metadata, indent=2)}
+
+Summary:
+{summary_md}
+""".strip()
+
+        r = requests.post(
+            "http://localhost:11434/api/generate",
+            json={
+                "model": model,
+                "prompt": prompt,
+                "stream": False,
+            },
+            timeout=30,
+        )
+
+        if r.status_code != 200:
+            return ""
+
+        return r.json().get("response", "").strip()
+
+    except Exception:
+        # AI is optional — never break the tool
+        return ""
+
+
+# -----------------------------
+# Core packager
+# -----------------------------
+def package_evidence(
+    input_dir: Path,
+    output_zip: Path,
+    metadata: dict,
+    ai: bool = False,
+    ai_model: str = "llama3",
+):
     created_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     metadata["created_at"] = created_at
 
@@ -71,6 +133,10 @@ def package_evidence(input_dir: Path, output_zip: Path, metadata: dict):
     manifest.sort(key=lambda x: x["file"])
     summary = build_summary(manifest, metadata)
 
+    ai_md = ""
+    if ai:
+        ai_md = ai_summary_local(summary, metadata, ai_model)
+
     with zipfile.ZipFile(output_zip, "w", zipfile.ZIP_DEFLATED) as z:
         for item in manifest:
             z.write(input_dir / item["file"], item["file"])
@@ -80,10 +146,18 @@ def package_evidence(input_dir: Path, output_zip: Path, metadata: dict):
         z.writestr("hashes.sha256", "\n".join(hashes) + "\n")
         z.writestr("summary.md", summary)
 
+        if ai_md:
+            z.writestr("ai_summary.md", ai_md)
+
     print(f"[+] Created bundle: {output_zip}")
     print(f"[+] Files packaged: {len(manifest)}")
+    if ai and not ai_md:
+        print("[!] AI summary requested but not generated (Ollama not running or model unavailable).")
 
 
+# -----------------------------
+# CLI
+# -----------------------------
 def main():
     ap = argparse.ArgumentParser(
         description="Package incident evidence into a verifiable forensic bundle."
@@ -94,6 +168,16 @@ def main():
     ap.add_argument("--analyst", default="Unknown")
     ap.add_argument("--source", default="SOC")
     ap.add_argument("--notes", default="")
+    ap.add_argument(
+        "--ai",
+        action="store_true",
+        help="Generate optional AI executive summary using local LLM (Ollama)",
+    )
+    ap.add_argument(
+        "--ai-model",
+        default="llama3",
+        help="Ollama model name (default: llama3)",
+    )
     args = ap.parse_args()
 
     metadata = {
@@ -103,7 +187,13 @@ def main():
         "notes": args.notes,
     }
 
-    package_evidence(Path(args.input_dir), Path(args.output), metadata)
+    package_evidence(
+        Path(args.input_dir),
+        Path(args.output),
+        metadata,
+        ai=args.ai,
+        ai_model=args.ai_model,
+    )
 
 
 if __name__ == "__main__":
